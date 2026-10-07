@@ -1,0 +1,174 @@
+name: Update game catalog
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      initialize:
+        description: Prepare the first complete installation for one product
+        type: boolean
+        default: false
+      product:
+        description: Product code for initialization (e.g. s2)
+        type: string
+      locale:
+        description: Optional language variant to initialize (e.g. zhCN)
+        type: string
+      region:
+        description: Optional China distribution to initialize (cn)
+        type: string
+      platform:
+        description: Platform to initialize, or mac to discover only native Mac updates
+        type: choice
+        options: [windows, mac]
+        default: windows
+      tags:
+        description: Optional override of the product's default manifest tags
+        type: string
+      executable:
+        description: Optional override of the product's default executable
+        type: string
+      data_directory:
+        description: CASC data directory for initialization
+        type: string
+      game_args:
+        description: Launch arguments as a JSON string array
+        type: string
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: game-catalog-update
+  cancel-in-progress: false
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.catalogs.outputs.matrix }}
+      has_jobs: ${{ steps.catalogs.outputs.has_jobs }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24
+      - name: Discover supported languages and changed catalogs
+        id: catalogs
+        env:
+          INITIALIZE: ${{ inputs.initialize || false }}
+          PRODUCT: ${{ inputs.product }}
+          LOCALE: ${{ inputs.locale }}
+          REGION: ${{ inputs.region }}
+          PLATFORM: ${{ inputs.platform || 'windows' }}
+        run: |
+          nix develop .#ci --command nu --no-config-file -c '
+            use ./update.nu language-jobs
+            let jobs = if $env.INITIALIZE == "true" and $env.PLATFORM == "mac" and $env.PRODUCT == "" {
+              if $env.LOCALE != "" or $env.REGION != "" { error make {msg: "Batch native initialization uses base international catalogs"} }
+              language-jobs --platform mac | where {|job| $job.initialize and $job.locale == "" }
+            } else if $env.INITIALIZE == "true" {
+              if $env.PRODUCT !~ "^[a-z0-9_-]+$" { error make {msg: "Initialization requires a product code"} }
+              if $env.REGION not-in ["" "cn"] { error make {msg: "Region must be empty or cn"} }
+              if $env.LOCALE != "" and $env.LOCALE !~ "^[a-z]{2}[A-Z]{2}$" { error make {msg: "Invalid locale"} }
+              let locale = if $env.REGION == "cn" and $env.LOCALE == "" { "zhCN" } else { $env.LOCALE }
+              if $env.PLATFORM == "mac" and $env.REGION != "" { error make {msg: "Native Mac initialization currently uses the international distribution"} }
+              let catalog = if $env.PLATFORM == "mac" { if $locale == "" { $"($env.PRODUCT).mac" } else { $"($env.PRODUCT).mac.($locale)" } } else if $env.REGION == "cn" { $"($env.PRODUCT).cn.($locale)" } else if $locale != "" { $"($env.PRODUCT).($locale)" } else { $env.PRODUCT }
+              [{product: $env.PRODUCT, locale: $locale, region: $env.REGION, platform: $env.PLATFORM, catalog: $catalog, initialize: true}]
+            } else {
+              let platform = if $env.PLATFORM == "mac" { "mac" } else { "" }
+              if $env.PRODUCT == "" { language-jobs --platform $platform } else { language-jobs --product $env.PRODUCT --platform $platform }
+            }
+            [ $"matrix=({include: $jobs} | to json --raw)" $"has_jobs=(not ($jobs | is-empty))" ] |
+              str join (char newline) | save --append --raw $env.GITHUB_OUTPUT
+          '
+  update:
+    needs: discover
+    if: needs.discover.outputs.has_jobs == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    concurrency:
+      group: catalog-${{ matrix.catalog }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - name: Make room for complete installations
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Generate verified catalogs with Nushell
+        env:
+          INITIALIZE: ${{ matrix.initialize }}
+          PRODUCT: ${{ matrix.product }}
+          LOCALE: ${{ matrix.locale }}
+          REGION: ${{ matrix.region }}
+          PLATFORM: ${{ matrix.platform || 'windows' }}
+          TAGS: ${{ inputs.tags }}
+          EXECUTABLE: ${{ inputs.executable }}
+          DATA_DIRECTORY: ${{ inputs.data_directory }}
+          GAME_ARGS: ${{ inputs.game_args }}
+          CATALOG: ${{ matrix.catalog }}
+          DISCOVERY_ERROR: ${{ matrix.discovery_error || '' }}
+        run: |
+          if [[ -n "$DISCOVERY_ERROR" ]]; then
+            printf '%s\n' "$DISCOVERY_ERROR" >&2
+            exit 1
+          fi
+          if [[ -n "$CATALOG" && -f "games/$CATALOG.nix" ]] && { [[ "$INITIALIZE" != true ]] || [[ $(nix eval --json --file "games/$CATALOG.nix" --apply 'g: g ? installation && (g.installation.storage.completeInstallation or false)') == true ]]; }; then
+            nix develop .#ci --command nu --no-config-file update.nu --checkpoint-directory prepared --catalog "$CATALOG"
+          elif [[ "$INITIALIZE" == true ]]; then
+            platform=""
+            if [[ "$PLATFORM" == mac ]]; then platform=mac; fi
+            nix develop .#ci --command nu --no-config-file update.nu \
+              --checkpoint-directory prepared \
+              --initialize --product "$PRODUCT" --locale "$LOCALE" --region "$REGION" --platform "$platform" --tags "$TAGS" \
+              --executable "$EXECUTABLE" --data-directory "$DATA_DIRECTORY" \
+              --game-args "$GAME_ARGS"
+          elif [[ -n "$PRODUCT" ]]; then
+            nix develop .#ci --command nu --no-config-file update.nu --checkpoint-directory prepared --product "$PRODUCT"
+          else
+            nix develop .#ci --command nu --no-config-file update.nu --checkpoint-directory prepared
+          fi
+      # Preserve expensive download results even if a later Git push conflicts.
+      - name: Collect only changed catalogs
+        if: ${{ always() }}
+        run: |
+          mkdir -p artifacts/games
+          { git diff --name-only -- games/; git ls-files --others --exclude-standard -- games/; } |
+            sort -u | while IFS= read -r path; do
+              if [[ -f "$path" ]]; then cp "$path" artifacts/games/; fi
+            done
+      - name: Save verified catalogs before publication
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-${{ matrix.catalog }}
+          path: |
+            artifacts/games/*.nix
+            prepared/*.nix
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: Publish pinned metadata assets and commit with Nushell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: nix develop .#ci --command nu --no-config-file -c 'use ./update.nu publish; publish games'
+
+  cleanup:
+    needs: [discover, update]
+    if: ${{ always() && needs.discover.result == 'success' }}
+    concurrency:
+      group: catalog-release-cleanup
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Remove obsolete catalog release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: nix develop .#ci --command nu --no-config-file -c 'use ./update.nu prune-catalogs; prune-catalogs --apply'
